@@ -11,6 +11,9 @@
 #include <sstream>
 #include <iostream>
 #include <typeinfo>
+#include <cmath>
+#include <array>
+#include <algorithm>
 
 #include "MEM_guardedalloc.h"
 
@@ -32,8 +35,11 @@
 #include "BLI_kdopbvh.h"
 #include "BLI_math_geom.h"
 #include "BLI_math_vector.h"
+#include "BLI_utildefines.h"
 
 #include "BKE_editmesh.h"
+
+#include "BKE_bvhutils.h"
 
 #include "BKE_editmesh_bvh.h" /* own include */
 // #include "BLI_bvhtree.h"
@@ -72,8 +78,19 @@ struct int4 {
   int w, x, y, z;
 };
 
+// struct float3 {
+//   float x, y, z;
+// };
+
+// 3Dベクトル構造体
 struct float3 {
   float x, y, z;
+  
+  float3 operator-(const float3 &v) const { return {x - v.x, y - v.y, z - v.z}; }
+  float3 cross(const float3 &v) const { 
+      return { y * v.z - z * v.y, z * v.x - x * v.z, x * v.y - y * v.x }; 
+  }
+  float dot(const float3 &v) const { return x * v.x + y * v.y + z * v.z; }
 };
 
 struct BMBVHTree {
@@ -143,21 +160,178 @@ BVHTree *build_bvh_tree_from_mesh(const std::vector<float3> &vertices, const std
   return tree;
 }
 
-BVHTreeOverlap *bvh_intersect(BVHTree *tree1, BVHTree *tree2, uint &overlap_len) {
-  
-  return BLI_bvhtree_overlap(tree1, tree2, &overlap_len, nullptr, nullptr);
+struct BMBVHTree_OverlapData {
+  const BMBVHTree *tree_pair[2];
+  float epsilon;
+};
+
+static bool bmbvh_overlap_cb(void *userdata, int index_a, int index_b, int /*thread*/)
+{
+  BMBVHTree_OverlapData *data = static_cast<BMBVHTree_OverlapData *>(userdata);
+  const BMBVHTree *bmtree_a = data->tree_pair[0];
+  const BMBVHTree *bmtree_b = data->tree_pair[1];
+
+  BMLoop **tri_a = bmtree_a->looptris[index_a];
+  BMLoop **tri_b = bmtree_b->looptris[index_b];
+  const float *tri_a_co[3] = {tri_a[0]->v->co, tri_a[1]->v->co, tri_a[2]->v->co};
+  const float *tri_b_co[3] = {tri_b[0]->v->co, tri_b[1]->v->co, tri_b[2]->v->co};
+  float ix_pair[2][3];
+  int verts_shared = 0;
+
+  if (bmtree_a->looptris == bmtree_b->looptris) {
+    if (UNLIKELY(tri_a[0]->f == tri_b[0]->f)) {
+      return false;
+    }
+
+    verts_shared = (ELEM(tri_a_co[0], UNPACK3(tri_b_co)) + ELEM(tri_a_co[1], UNPACK3(tri_b_co)) +
+                    ELEM(tri_a_co[2], UNPACK3(tri_b_co)));
+
+    /* if 2 points are shared, bail out */
+    if (verts_shared >= 2) {
+      return false;
+    }
+  }
+
+  return (isect_tri_tri_v3(UNPACK3(tri_a_co), UNPACK3(tri_b_co), ix_pair[0], ix_pair[1]) &&
+          /* if we share a vertex, check the intersection isn't a 'point' */
+          ((verts_shared == 0) || (len_squared_v3v3(ix_pair[0], ix_pair[1]) > data->epsilon)));
 }
 
-void check_mesh_intersection(BVHTree *tree1, BVHTree *tree2) {
-  uint overlap_len = 0;
+// 三角形の交差判定関数
+bool precise_triangle_intersection(const float3 &v0, const float3 &v1, const float3 &v2,
+  const float3 &u0, const float3 &u1, const float3 &u2) {
+    // 1. 各三角形の法線を求める
+    float3 N1 = (v1 - v0).cross(v2 - v0);  // 三角形1の法線
+    float3 N2 = (u1 - u0).cross(u2 - u0);  // 三角形2の法線
+
+    // 2. 分離軸の候補（3つの三角形の辺の外積）
+    std::array<float3, 9> axes = {
+    (v1 - v0).cross(N1), (v2 - v1).cross(N1), (v0 - v2).cross(N1),  // 三角形1の辺×法線
+    (u1 - u0).cross(N2), (u2 - u1).cross(N2), (u0 - u2).cross(N2),  // 三角形2の辺×法線
+    N1, N2  // 各三角形の法線
+  };
+
+  // 3. 各分離軸について投影チェック
+  for (const auto &axis : axes) {
+    // ゼロベクトルは無視
+    if (axis.x == 0 && axis.y == 0 && axis.z == 0) continue;
+
+    // 三角形の頂点を軸に投影
+    float tri1_proj[] = { v0.dot(axis), v1.dot(axis), v2.dot(axis) };
+    float tri2_proj[] = { u0.dot(axis), u1.dot(axis), u2.dot(axis) };
+
+    // 最小・最大投影値を求める
+    float tri1_min = *std::min_element(tri1_proj, tri1_proj + 3);
+    float tri1_max = *std::max_element(tri1_proj, tri1_proj + 3);
+    float tri2_min = *std::min_element(tri2_proj, tri2_proj + 3);
+    float tri2_max = *std::max_element(tri2_proj, tri2_proj + 3);
+
+    // 投影の範囲が分離しているかチェック
+    if (tri1_max < tri2_min || tri2_max < tri1_min) {
+      return false;  // 分離されているので交差なし
+    }
+  }
+
+  return true;  // すべての軸で重なっているので交差あり
+}
+
+// 交差ペアを検証し、新たな BVHTreeOverlap 配列を作成
+void filter_intersections(
+  const std::vector<float3> &vertices1,
+  const std::vector<int4> &faces1,
+  const std::vector<float3> &vertices2,
+  const std::vector<int4> &faces2,
+  BVHTreeOverlap *overlap, uint overlap_len) {
+  
+    // std::vector<BVHTreeOverlap> refined_overlaps;
+
+  for (int i = 0; i < overlap_len; i++) {
+      const auto &over = overlap[i];
+
+      float3 v0, v1, v2, v3;
+      float3 u0, u1, u2, u3;
+
+      // faces1 の三角形・四角形処理
+      if (faces1[over.indexA].z == -1) {
+          v0 = vertices1[faces1[over.indexA].w];
+          v1 = vertices1[faces1[over.indexA].x];
+          v2 = vertices1[faces1[over.indexA].y];
+          v3 = v0; // 無効な v3
+      } else {
+          v0 = vertices1[faces1[over.indexA].w];
+          v1 = vertices1[faces1[over.indexA].x];
+          v2 = vertices1[faces1[over.indexA].y];
+          v3 = vertices1[faces1[over.indexA].z];
+      }
+
+      // faces2 の三角形・四角形処理
+      if (faces2[over.indexB].z == -1) {
+          u0 = vertices2[faces2[over.indexB].w];
+          u1 = vertices2[faces2[over.indexB].x];
+          u2 = vertices2[faces2[over.indexB].y];
+          u3 = u0; // 無効な u3
+      } else {
+          u0 = vertices2[faces2[over.indexB].w];
+          u1 = vertices2[faces2[over.indexB].x];
+          u2 = vertices2[faces2[over.indexB].y];
+          u3 = vertices2[faces2[over.indexB].z];
+      }
+
+      // 三角形 vs 三角形 の交差判定
+      if (precise_triangle_intersection(v0, v1, v2, u0, u1, u2) ||
+          precise_triangle_intersection(v0, v1, v2, u0, u1, u3) ||
+          precise_triangle_intersection(v0, v1, v2, u0, u2, u3) ||
+          precise_triangle_intersection(v0, v1, v2, u1, u2, u3)) {
+          // refined_overlaps.push_back(over);
+          std::cout << over.indexA << ":" << over.indexB << std::endl;
+          continue;
+      }
+
+      // 四角形の交差判定
+      if (faces1[over.indexA].z != -1) {
+          if (precise_triangle_intersection(v0, v2, v3, u0, u1, u2) ||
+              precise_triangle_intersection(v0, v2, v3, u0, u1, u3) ||
+              precise_triangle_intersection(v0, v2, v3, u0, u2, u3) ||
+              precise_triangle_intersection(v0, v2, v3, u1, u2, u3)) {
+              // refined_overlaps.push_back(over);
+              std::cout << over.indexA << ":" << over.indexB << std::endl;
+              continue;
+          }
+      }
+
+      if (faces2[over.indexB].z != -1) {
+          if (precise_triangle_intersection(v0, v1, v2, u0, u1, u3) ||
+              precise_triangle_intersection(v0, v1, v2, u0, u2, u3) ||
+              precise_triangle_intersection(v0, v1, v2, u1, u2, u3) ||
+              precise_triangle_intersection(v0, v1, v3, u0, u1, u2) ||
+              precise_triangle_intersection(v0, v1, v3, u0, u1, u3) ||
+              precise_triangle_intersection(v0, v1, v3, u0, u2, u3) ||
+              precise_triangle_intersection(v0, v1, v3, u1, u2, u3)) {
+              // refined_overlaps.push_back(over);
+              std::cout << over.indexA << ":" << over.indexB << std::endl;
+              continue;
+          }
+      }
+  }
+
+  // return refined_overlaps;
+}
+
+BVHTreeOverlap *bvh_intersect(BVHTree *tree1, BVHTree *tree2, uint *overlap_len) {
+  
+  return BLI_bvhtree_overlap(tree1, tree2, overlap_len, nullptr, nullptr);
+}
+
+BVHTreeOverlap *check_mesh_intersection(BVHTree *tree1, BVHTree *tree2, uint *overlap_len) {
+  
   BVHTreeOverlap *overlap = bvh_intersect(tree1, tree2, overlap_len);
   
-  if (overlap && overlap_len > 0) {
-    std::cout << "Num : " << overlap_len << std::endl;
-    for (uint  i = 0; i < overlap_len; i++) {
-      std::cout << overlap[i].indexA << " : " << overlap[i].indexB << std::endl;
+  if (overlap && *overlap_len > 0) {
+    std::cout << "Num : " << *overlap_len << std::endl;
+    for (uint  i = 0; i < *overlap_len; i++) {
+      // std::cout << overlap[i].indexA << " : " << overlap[i].indexB << std::endl;
     }
-    MEM_freeN(overlap);
+    // MEM_freeN(overlap);
   }else{
     std::cout << "not intersection" << std::endl;
   }
@@ -165,6 +339,8 @@ void check_mesh_intersection(BVHTree *tree1, BVHTree *tree2) {
 
   BLI_bvhtree_free(tree1);
   BLI_bvhtree_free(tree2);
+
+  return overlap;
 }
 
 
@@ -298,12 +474,20 @@ static PyObject *read_obj_data(PyObject *self, PyObject *args)
   std::vector<float3> vertices2;
   std::vector<int4> faces2;
 
+  uint overlap_len = 0;
+
   print_mesh_vertices(meshes[0], vertices1, faces1);
   print_mesh_vertices(meshes[1], vertices2, faces2);
 
   BVHTree *tree1 = build_bvh_tree_from_mesh(vertices1, faces1);
   BVHTree *tree2 = build_bvh_tree_from_mesh(vertices2, faces2);
-  check_mesh_intersection(tree1, tree2);
+  // BVHTreeFromMesh treedata1 = {nullptr};
+  // BVHTreeFromMesh treedata2 = {nullptr};
+  // BVHTree *tree1 = BKE_bvhtree_from_mesh_get(&treedata1, meshes[0], BVHTREE_FROM_VERTS, 2);
+  // BVHTree *tree2 = BKE_bvhtree_from_mesh_get(&treedata2, meshes[1], BVHTREE_FROM_VERTS, 2);
+  BVHTreeOverlap *overlap = check_mesh_intersection(tree1, tree2, &overlap_len);
+
+  filter_intersections( vertices1, faces1, vertices2, faces2, overlap, overlap_len);
 
 
 
